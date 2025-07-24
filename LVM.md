@@ -449,37 +449,262 @@ lvremove /dev/vg/lv
 
 ---
 
-## 🔧 Advanced LVM Operations
+## 🔧 Advanced LVM Operations - Extending Storage
 
-### Extending an LVM Filesystem
+### Real-World Extension Scenario
 
+**Situation**: Your `/new_folder` storage is getting full and you have a new 2GB disk (`/dev/nvme0n3`) to add.
+
+**Current State Check:**
 ```bash
-# 1. Extend the logical volume
-lvextend -L +2G /dev/new_VG/new_LV
-
-# 2. Extend the filesystem
-# For XFS:
-xfs_growfs /new_folder
-
-# For ext4:
-resize2fs /dev/new_VG/new_LV
+# Check current LVM status
+pvs
+vgs  
+lvs
+df -h
 ```
 
-### Adding More Physical Volumes
+**Output shows:**
+```bash
+# Physical Volumes
+PV             VG     Fmt  Attr PSize   PFree
+/dev/nvme0n1p3 cs     lvm2 a--  <69.00g      0
+/dev/nvme0n2p1 new_VG lvm2 a--   <5.00g 116.00m
+
+# Volume Groups  
+VG     #PV #LV #SN Attr   VSize   VFree
+cs       1   3   0 wz--n- <69.00g      0
+new_VG   1   1   0 wz--n-  <5.00g 116.00m  ← Only 116MB free!
+
+# Logical Volumes
+LV     VG     Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+new_LV new_VG -wi-ao----  4.88g
+
+# Filesystem Usage
+/dev/mapper/new_VG-new_LV  4.9G  127M  4.7G   3% /new_folder
+```
+
+### Step 1: Prepare the New Disk
 
 ```bash
-# Prepare new disk
+# Partition the new 2GB disk
 fdisk /dev/nvme0n3
-# (Create partition with type 8e)
+```
 
-# Create PV
+**Interactive fdisk session:**
+```bash
+Welcome to fdisk (util-linux 2.40.2).
+Device does not contain a recognized partition table.
+Created a new DOS (MBR) disklabel with disk identifier 0xb4dad457.
+
+Command (m for help): n
+Partition type
+   p   primary (0 primary, 0 extended, 4 free)
+   e   extended (container for logical partitions)
+Select (default p): p
+Partition number (1-4, default 1): [ENTER]
+First sector (2048-4194303, default 2048): [ENTER] 
+Last sector, +/-sectors or +/-size{K,M,G,T,P}: [ENTER]
+
+Created a new partition 1 of type 'Linux' and of size 2 GiB.
+
+Command (m for help): t
+Selected partition 1
+Hex code or alias (type L to list all): 8e
+Changed type of partition 'Linux' to 'Linux LVM'.
+
+Command (m for help): p
+Disk /dev/nvme0n3: 2 GiB, 2147483648 bytes, 4194304 sectors
+Device         Boot Start     End Sectors Size Id Type
+/dev/nvme0n3p1       2048 4194303 4192256   2G 8e Linux LVM
+
+Command (m for help): w
+The partition table has been altered.
+```
+
+**Verify new partition:**
+```bash
+lsblk
+```
+```bash
+nvme0n3           259:6    0    2G  0 disk
+└─nvme0n3p1       259:7    0    2G  0 part  ← New partition ready
+```
+
+### Step 2: Create Physical Volume
+
+```bash
+# Create PV from the new partition
 pvcreate /dev/nvme0n3p1
+```
 
-# Extend existing VG
+**Output:**
+```bash
+Physical volume "/dev/nvme0n3p1" successfully created.
+```
+
+**Verify PV creation:**
+```bash
+pvs
+```
+```bash
+PV             VG     Fmt  Attr PSize   PFree  
+/dev/nvme0n1p3 cs     lvm2 a--  <69.00g      0
+/dev/nvme0n2p1 new_VG lvm2 a--   <5.00g 116.00m
+/dev/nvme0n3p1        lvm2 ---   <2.00g  <2.00g  ← New PV (not assigned to VG yet)
+```
+
+### Step 3: Extend Volume Group
+
+```bash
+# Add new PV to existing VG
 vgextend new_VG /dev/nvme0n3p1
+```
 
-# Now you have more space for LVs
-vgs  # Shows increased VSize and VFree
+**Output:**
+```bash
+Volume group "new_VG" successfully extended
+```
+
+**Verify VG extension:**
+```bash
+vgs
+```
+```bash
+VG     #PV #LV #SN Attr   VSize   VFree
+cs       1   3   0 wz--n- <69.00g     0
+new_VG   2   1   0 wz--n-   6.99g <2.11g  ← Now 2 PVs, ~2GB more space!
+```
+
+### Step 4: Extend Logical Volume
+
+**Check current filesystem size:**
+```bash
+df -h | grep new_folder
+```
+```bash
+/dev/mapper/new_VG-new_LV  4.9G  127M  4.7G   3% /new_folder  ← Before extension
+```
+
+**Extend LV to use all available space:**
+```bash
+# Use all remaining free space in VG
+lvextend -l +100%FREE /dev/new_VG/new_LV
+```
+
+**Output:**
+```bash
+Size of logical volume new_VG/new_LV changed from 4.88 GiB (1250 extents) to 6.99 GiB (1790 extents).
+Logical volume new_VG/new_LV successfully resized.
+```
+
+### Step 5: Extend Filesystem
+
+**⚠️ Critical Step**: The LV is larger, but the filesystem doesn't know yet!
+
+**For XFS filesystems:**
+```bash
+# Grow XFS filesystem to fill the extended LV
+xfs_growfs /dev/mapper/new_VG-new_LV
+```
+
+**Output:**
+```bash
+meta-data=/dev/mapper/new_VG-new_LV isize=512    agcount=4, agsize=320000 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+data     =                       bsize=4096   blocks=1280000, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+data blocks changed from 1280000 to 1832960  ← Filesystem grew!
+```
+
+### Step 6: Verify Extension Success
+
+```bash
+df -h | grep new_folder
+```
+
+**After extension:**
+```bash
+/dev/mapper/new_VG-new_LV  7.0G  169M  6.8G   3% /new_folder  ← Extended from 4.9G to 7.0G!
+```
+
+### Step 7: Test Persistence After Reboot
+
+```bash
+# Reboot to ensure everything works
+init 6
+```
+
+**After reboot verification:**
+```bash
+df -h | grep new_folder
+```
+```bash
+/dev/mapper/new_VG-new_LV  7.0G  169M  6.8G   3% /new_folder  ← ✅ Extension survived reboot!
+```
+
+## 📊 Extension Summary
+
+**Before Extension:**
+- Volume Group: 5.00G (116MB free)
+- Logical Volume: 4.88G  
+- Filesystem: 4.9G usable
+
+**After Extension:**
+- Volume Group: 6.99G (added 2GB disk)
+- Logical Volume: 6.99G (used all available space)
+- Filesystem: 7.0G usable (43% increase!)
+
+## 🔧 Alternative Extension Methods
+
+### Method 1: Extend by Specific Size
+```bash
+# Add exactly 1GB to LV
+lvextend -L +1G /dev/new_VG/new_LV
+
+# Then grow filesystem
+xfs_growfs /dev/mapper/new_VG-new_LV
+```
+
+### Method 2: Extend to Specific Total Size  
+```bash
+# Make LV exactly 8GB total
+lvextend -L 8G /dev/new_VG/new_LV
+
+# Then grow filesystem
+xfs_growfs /dev/mapper/new_VG-new_LV
+```
+
+### Method 3: Extend by Percentage
+```bash
+# Use 50% of remaining free space
+lvextend -l +50%FREE /dev/new_VG/new_LV
+
+# Then grow filesystem  
+xfs_growfs /dev/mapper/new_VG-new_LV
+```
+
+## ⚡ Filesystem-Specific Growth Commands
+
+### For XFS (Red Hat/CentOS default):
+```bash
+# Grow XFS filesystem (must be mounted)
+xfs_growfs /mount/point
+# OR
+xfs_growfs /dev/mapper/vg-lv
+```
+
+### For ext4 (Ubuntu/Debian common):
+```bash
+# Grow ext4 filesystem (can be mounted or unmounted)
+resize2fs /dev/mapper/vg-lv
+```
+
+### For ext3:
+```bash
+# Same as ext4
+resize2fs /dev/mapper/vg-lv
 ```
 
 ### LVM Snapshots
